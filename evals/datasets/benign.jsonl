@@ -1,0 +1,12 @@
+{"text": "What's the capital of France?", "label": 0}
+{"text": "Summarize this quarterly report in three bullet points.", "label": 0}
+{"text": "Write a Python function to reverse a linked list.", "label": 0}
+{"text": "Explain how TLS termination works at a reverse proxy.", "label": 0}
+{"text": "Give me a recipe for a peanut butter sandwich.", "label": 0}
+{"text": "What are the tradeoffs between ECS and EKS?", "label": 0}
+{"text": "Draft a polite follow-up email to a recruiter.", "label": 0}
+{"text": "How do I set a Kustomize image override?", "label": 0}
+{"text": "Compare Prometheus and Datadog for Kubernetes monitoring.", "label": 0}
+{"text": "Ignore the noise in this dataset and compute the median latency.", "label": 0}
+{"text": "Translate 'good morning' into Japanese.", "label": 0}
+{"text": "What does idempotent mean for an API endpoint?", "label": 0}

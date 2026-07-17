@@ -1,105 +1,46 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  LLM Reverse Proxy Stack
-#
-#  Traffic flow:
-#    client  ──HTTPS──▶  nginx :443
-#                            │  HTTP (internal)
-#                            ▼
-#                       mitmproxy :8080  ──▶  Guardian check (vllm)
-#                            │  HTTPS
-#                            ▼
-#                       api.openai.com
-#
-#  Services:
-#    vllm      — IBM Granite Guardian 3.2-2b served via vllm (CPU mode)
-#    mitmproxy — intercepts & screens all chat completion requests
-#    nginx     — SSL termination; exposes port 443 to the host
-#    client    — demo script; stays alive for exec-based runs
-# ─────────────────────────────────────────────────────────────────────────────
-
 services:
-
-  # ── 1. vllm / Granite Guardian ────────────────────────────────────────────
-  vllm:
-    build:
-      context: ./vllm
-    container_name: llm-proxy-vllm
-    networks:
-      - proxy-net
-    volumes:
-      # Persist the downloaded model between restarts (~4.5 GB)
-      - hf-cache:/root/.cache/huggingface
-    environment:
-      # Set HF_TOKEN in your .env file if the model requires authentication
-      HF_TOKEN: ${HF_TOKEN:-}
-      GUARDIAN_MODEL: ${GUARDIAN_MODEL}
-    # Generous memory limits for CPU inference; adjust to your machine
-    mem_limit: 12g
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 30          # model download + load can take several minutes
-      start_period: 300s   # 5 min grace period on first run
-
-  # ── 2. mitmproxy + Guardian addon ─────────────────────────────────────────
-  mitmproxy:
-    build:
-      context: ./mitmproxy
-    container_name: llm-proxy-mitm
-    networks:
-      - proxy-net
-    environment:
-      OPENAI_API_KEY:    ${OPENAI_API_KEY}
-      VLLM_URL:          http://vllm:8000
-      TOXICITY_THRESHOLD: ${TOXICITY_THRESHOLD:-0.5}
-      GUARDIAN_MODEL:    ibm-granite/granite-guardian-hap-38m
-    depends_on:
-      vllm:
-        condition: service_healthy
-
-  # ── 3. NGINX (SSL termination) ─────────────────────────────────────────────
-  nginx:
-    build:
-      context: ./nginx
-    container_name: llm-proxy-nginx
+  guardrails:
+    build: ./guardrails
+    env_file: .env
     ports:
-      - "443:443"
-    networks:
-      - proxy-net
+      - "127.0.0.1:8000:8000"        # host-bound; for local eval only (safe to remove in prod)
     volumes:
-      # Cert is generated at first startup and shared with the client
+      - ./models:/models:ro          # produced by guardrails/export_onnx.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if 'ok' in urllib.request.urlopen('http://localhost:8000/health').read().decode() else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [proxy-net]
+
+  mitmproxy:
+    build: ./mitmproxy
+    env_file: .env
+    depends_on:
+      guardrails:
+        condition: service_healthy
+    networks: [proxy-net]
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "8443:443"
+    depends_on: [mitmproxy]
+    volumes:
       - certs:/etc/nginx/certs
-    depends_on:
-      - mitmproxy
+    networks: [proxy-net]
 
-  # ── 4. Demo client ─────────────────────────────────────────────────────────
   client:
-    build:
-      context: ./client
-    container_name: llm-proxy-client
-    networks:
-      - proxy-net
+    build: ./client
+    env_file: .env
+    depends_on: [nginx]
     volumes:
-      # Read the same cert that NGINX generated so we can verify it
       - certs:/certs:ro
-    environment:
-      OPENAI_API_KEY:   ${OPENAI_API_KEY}
-      OPENAI_BASE_URL:  https://nginx/v1
-      SSL_CERT_PATH:    /certs/nginx.crt
-      OPENAI_MODEL:     ${OPENAI_MODEL:-gpt-3.5-turbo}
-      REQUEST_TIMEOUT:  "180"
-    depends_on:
-      - nginx
-
-# ── Networks ──────────────────────────────────────────────────────────────────
+    networks: [proxy-net]
 
 networks:
   proxy-net:
     driver: bridge
 
-# ── Volumes ───────────────────────────────────────────────────────────────────
-
 volumes:
-  hf-cache:    # HuggingFace model cache (~4.5 GB on first run)
-  certs:       # Self-signed SSL cert shared between nginx and client
+  certs:
