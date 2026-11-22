@@ -1,10 +1,12 @@
 FROM python:3.11-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1 \
+    HF_HOME=/hf-cache
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY server.py .
-# Models are mounted at /models (see docker-compose volume) after export_onnx.py
+COPY server.py manifest.py prepare_models.py ./
+# Models live in /models (bind-mounted ./models). The `model-init` service runs
+# prepare_models.py from this same image to download / export / verify them
+# before this service starts; see docker-compose.yml.
 EXPOSE 8000
-# keep-alive longer than the proxy client's pool expiry (60 s) so pooled
-# connections are closed by the client, not reset under it
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,83 +1,97 @@
 """Async client to the guardrails service.
 
-One module-level ``httpx.AsyncClient`` with keep-alive. The original code built
-a new client per call; constructing an AsyncClient builds a TLS context and
-parses the CA bundle even for plain http:// (measured ~50 ms of CPU that
-blocks the event loop -- per call, on both the request and response paths).
-See docs/perf-report.md, B1.
+Performance notes (bench/bench_transport.py):
 
-``GUARDRAILS_UDS=/path/to.sock`` switches to a Unix domain socket (both
-containers must share the socket's volume).
-
-Batch API: every new message of a turn is sent in ONE request; the service
-runs all windows of all texts through each model as a batch.
+* The old code built a new `httpx.AsyncClient` per call. Constructing a client
+  builds an SSL context (loads the CA bundle) even for a plain-http URL --
+  ~50 ms on this box -- and then opens a fresh TCP connection. A module-level
+  client with keep-alive brings the hop from ~75 ms to ~3 ms p50 and stops
+  falling over under concurrency.
+* HTTP/2 and Unix sockets measured within noise of HTTP/1.1 keep-alive for this
+  traffic pattern (one small request at a time per flow), so the plain option
+  is kept. `GUARDRAILS_UDS=/path.sock` switches to a Unix socket if the two
+  containers share a volume.
+* `decide_many` (System-1 decision endpoint) sends every new unit of a turn in
+  ONE round-trip with its role / tool context; the service returns per-label
+  probabilities for the labels relevant to each role. `classify_many` is the
+  older per-check API, kept for evals.
 """
-from __future__ import annotations
-
+import asyncio
 import os
+from collections import defaultdict
 
 import httpx
 
 _URL = os.getenv("GUARDRAILS_URL", "http://guardrails:8000")
-_UDS = os.getenv("GUARDRAILS_UDS", "")
-_TIMEOUT = float(os.getenv("GUARDRAILS_TIMEOUT", "2.0"))
+_UDS = os.getenv("GUARDRAILS_UDS")
+_TIMEOUT = float(os.getenv("GUARDRAILS_TIMEOUT", "5.0"))
 
 _client: httpx.AsyncClient | None = None
+_transport_override: httpx.AsyncBaseTransport | None = None
 
 
-def _get_client() -> httpx.AsyncClient:
+def configure(transport: httpx.AsyncBaseTransport | None = None, url: str | None = None) -> None:
+    """Test / benchmark hook: route calls through a given transport (e.g. an
+    httpx.MockTransport) and/or a different base URL. Resets the client."""
+    global _client, _transport_override, _URL
+    _transport_override, _client = transport, None
+    if url:
+        _URL = url
+
+
+def _get() -> httpx.AsyncClient:
     global _client
-    if _client is None or _client.is_closed:
-        transport = httpx.AsyncHTTPTransport(uds=_UDS, retries=1) if _UDS \
-            else httpx.AsyncHTTPTransport(retries=1)
-        _client = httpx.AsyncClient(
-            base_url="http://guardrails" if _UDS else _URL,
-            timeout=_TIMEOUT,
-            transport=transport,
-            # keep-alive shorter than the server's (--timeout-keep-alive 75)
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32,
-                                keepalive_expiry=60.0),
-        )
+    if _client is None:
+        kw = dict(timeout=_TIMEOUT, verify=False,      # plain http; skip SSL-context build
+                  limits=httpx.Limits(max_keepalive_connections=16, max_connections=64))
+        if _transport_override is not None:
+            _client = httpx.AsyncClient(transport=_transport_override, **kw)
+        elif _UDS:
+            _client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=_UDS), **kw)
+        else:
+            _client = httpx.AsyncClient(**kw)
     return _client
 
 
-async def _post(body: dict) -> dict:
-    client = _get_client()
-    # tell the service when we will stop waiting, so it can drop the work
-    # instead of computing answers nobody reads (see guardrails/server.py)
-    body = {**body, "deadline_ms": max(1.0, _TIMEOUT * 1000 - 50)}
-    try:
-        resp = await client.post("/v1/classify", json=body)
-    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError):
-        # stale pooled connection closed by the server: one clean retry
-        # (classification is a pure function, safe to repeat). Timeouts are
-        # NOT retried -- that would double the worst-case latency budget.
-        resp = await client.post("/v1/classify", json=body)
+async def decide_many(items: list[tuple[str, str, str | None, tuple[str, ...]]]) -> list[dict]:
+    """items: [(text, role, tool, labels)] -> [{"scores": {label: p}, "windows": n, "passes": k}].
+    One round-trip for the whole turn. Raises on transport / HTTP error. Labels
+    are sent explicitly so a service-side config drift cannot silently drop a check."""
+    if not items:
+        return []
+    resp = await _get().post(f"{_URL}/v1/decide", json={"items": [
+        {"text": t, "role": r, "tool": tl, "labels": list(lb)} for t, r, tl, lb in items]})
     resp.raise_for_status()
-    return resp.json()
+    return resp.json()["decisions"]
 
 
 async def classify(text: str, checks=("injection", "toxicity")) -> dict:
-    """Single text -> {check: {"score": float}}  (original API, kept)."""
-    data = await _post({"text": text, "checks": list(checks)})
-    return data["results"]
+    """Single text -> {check: {"score": float}}. Kept for compatibility / evals."""
+    return (await classify_many([(text, tuple(checks))]))[0]
 
 
-async def classify_batch(items: list[tuple[str, tuple[str, ...]]]) -> list[dict]:
-    """[(text, checks), ...] -> [{check: {"score": float}}, ...] in the same order.
-
-    Raises if the service is unreachable or returns an incomplete answer, so
-    callers apply their fail mode instead of trusting a partial result."""
+async def classify_many(items: list[tuple[str, tuple[str, ...]]]) -> list[dict]:
+    """items: [(text, checks)] -> list of {check: {"score": float, "windows": int}},
+    same order. Raises on transport / HTTP error (caller applies fail mode)."""
     if not items:
         return []
-    data = await _post({"items": [{"text": t, "checks": list(c)} for t, c in items]})
-    results = data.get("items")
-    if not isinstance(results, list) or len(results) != len(items):
-        raise ValueError("guardrails returned a malformed batch response")
-    for (_, checks), r in zip(items, results):
-        if any(c not in r for c in checks):
-            raise ValueError("guardrails response is missing a requested check")
-    return results
+    groups: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for i, (_, checks) in enumerate(items):
+        groups[tuple(checks)].append(i)
+    out: list[dict | None] = [None] * len(items)
+    client = _get()
+
+    async def one(checks, idxs):
+        resp = await client.post(f"{_URL}/v1/classify",
+                                 json={"texts": [items[i][0] for i in idxs],
+                                       "checks": list(checks)})
+        resp.raise_for_status()
+        results = resp.json()["results"]
+        for i, r in zip(idxs, results):
+            out[i] = r
+
+    await asyncio.gather(*(one(c, idxs) for c, idxs in groups.items()))
+    return out  # type: ignore[return-value]
 
 
 async def aclose():

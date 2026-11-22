@@ -1,38 +1,148 @@
+# llm-proxy: NGINX (TLS) -> mitmproxy firewall addon -> upstream LLM,
+# with the guardrails decision service (System 1) alongside.
+#
+#   docker compose up --build                      # node A: the firewall (default)
+#   docker compose --profile local-llm up          # + node B: local LLM (vLLM, NVIDIA GPU)
+#   docker compose --profile system2-gpu up        # + node B: System-2 judge (vLLM, GPU)
+#   docker compose --profile system2 up            # + System-2 judge on CPU (slow: 10-40 s/call)
+#   docker compose --profile observability up      # + node C: Prometheus
+#   docker compose --profile demo up               # + the demo client container
+#
+# Node A/B/C follow docs/infrastructure/colo-deployment.md. .env is optional;
+# every setting has a default (see .env.example).
+
 services:
-  guardrails:
+  # ── one-shot: download / export / verify models into ./models ─────────────
+  model-init:
+    env_file: [{path: .env, required: false}]
     build: ./guardrails
-    env_file: .env
-    ports:
-      - "127.0.0.1:8000:8000"        # host-bound; for local eval only (safe to remove in prod)
+    image: llm-proxy-guardrails:local
+    command: ["python", "prepare_models.py"]
     volumes:
-      - ./models:/models:ro          # produced by guardrails/export_onnx.py
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if 'ok' in urllib.request.urlopen('http://localhost:8000/health').read().decode() else 1)"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
+      - ./models:/models
+      - hf-cache:/hf-cache
+    restart: "no"
     networks: [proxy-net]
 
+  # ── node A: System-1 decision service (stock classifiers or an OpenJev model) ─
+  guardrails:
+    env_file: [{path: .env, required: false}]
+    build: ./guardrails
+    image: llm-proxy-guardrails:local
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8000:8000"        # host-bound, for evals/run_eval.py; never exposed publicly
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8000/health'))['status']=='ok' else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    networks: [proxy-net]
+
+  # ── node A: the firewall ──────────────────────────────────────────────────
   mitmproxy:
+    env_file: [{path: .env, required: false}]
     build: ./mitmproxy
-    env_file: .env
+    environment:
+      # internal topology is owned by this file, not by .env: a GUARDRAILS_URL
+      # exported in your shell for run_eval.py must not leak in here
+      GUARDRAILS_URL: http://guardrails:8000
+      UPSTREAM_URL: ${UPSTREAM_URL:-https://api.openai.com}
+      AUDIT_LOG: ${AUDIT_LOG:-/var/log/firewall/audit.jsonl}
     depends_on:
       guardrails:
         condition: service_healthy
+    volumes:
+      - firewall-logs:/var/log/firewall
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/firewall/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
     networks: [proxy-net]
 
+  # ── node A: TLS edge ──────────────────────────────────────────────────────
   nginx:
     build: ./nginx
     ports:
       - "8443:443"
-    depends_on: [mitmproxy]
+    depends_on:
+      mitmproxy:
+        condition: service_healthy
     volumes:
       - certs:/etc/nginx/certs
+    restart: unless-stopped
     networks: [proxy-net]
 
+  # ── node B (optional): local upstream LLM on GPU ──────────────────────────
+  # Set UPSTREAM_URL=http://llm:8000 in .env to route the firewall to it.
+  llm:
+    profiles: ["local-llm"]
+    image: vllm/vllm-openai:${VLLM_TAG:-v0.6.6}
+    command: ["--model", "${LOCAL_LLM_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}",
+              "--served-model-name", "local-llm", "gpt-3.5-turbo",
+              "--gpu-memory-utilization", "${LLM_GPU_FRACTION:-0.45}", "--port", "8000"]
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    networks: [proxy-net]
+
+  # ── node B (optional): System-2 judge on GPU ──────────────────────────────
+  # Set S2_MODE=race, S2_URL=http://judge:8000 in .env.
+  judge:
+    profiles: ["system2-gpu"]
+    image: vllm/vllm-openai:${VLLM_TAG:-v0.6.6}
+    command: ["--model", "${S2_MODEL:-ibm-granite/granite-guardian-3.2-2b}",
+              "--gpu-memory-utilization", "${JUDGE_GPU_FRACTION:-0.45}", "--port", "8000"]
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    networks: [proxy-net]
+
+  # ── System-2 judge on CPU (optional; too slow for inline use) ─────────────
+  guardian:
+    env_file: [{path: .env, required: false}]
+    profiles: ["system2"]
+    build: .                         # guardian_server.py
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    networks: [proxy-net]
+
+  # ── node C (optional): metrics ────────────────────────────────────────────
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [proxy-net]
+
+  # ── demo client (optional) ────────────────────────────────────────────────
   client:
+    env_file: [{path: .env, required: false}]
+    profiles: ["demo"]
     build: ./client
-    env_file: .env
     depends_on: [nginx]
     volumes:
       - certs:/certs:ro
@@ -44,3 +154,5 @@ networks:
 
 volumes:
   certs:
+  hf-cache:
+  firewall-logs:

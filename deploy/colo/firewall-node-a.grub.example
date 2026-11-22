@@ -1,0 +1,38 @@
+# Example kernel command-line additions for "node A" (the hot-path VM running
+# the mitmproxy addon + guardrails System-1 service). Append to
+# GRUB_CMDLINE_LINUX in /etc/default/grub inside the VM image, then
+# `update-grub` (Debian/Ubuntu) or `grub2-mkconfig` (RHEL-family) and reboot.
+# Requires a reboot to take effect -- bake it into the base VM image rather
+# than applying per-deployment.
+#
+# ADAPT every core number to the real pinned-core range for this VM
+# (deploy/colo/docker-compose.colo.yml uses the same cores).
+#
+#   isolcpus=2,3,4,5       remove cores 2-5 from the general scheduler: only
+#                          processes explicitly pinned there (taskset/cpuset)
+#                          run on them
+#   nohz_full=2,3,4,5      stop the scheduler tick on those cores when they
+#                          have a single runnable task -- removes a periodic
+#                          interrupt source of jitter
+#   rcu_nocbs=2,3,4,5      move RCU callback processing off those cores
+#   default_hugepagesz=2M hugepagesz=2M hugepages=1024
+#                          reserve huge pages at boot (simpler/more reliable
+#                          than reserving at runtime once memory is fragmented)
+#   intel_idle.max_cstate=0 processor.max_cstate=0
+#                          belt-and-braces C-state disable at the kernel level
+#                          (tune-host.sh does this at runtime via cpupower;
+#                          having both means one survives even if the other
+#                          isn't supported on this guest)
+#
+# Example line to add:
+GRUB_CMDLINE_LINUX="isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5 default_hugepagesz=2M hugepagesz=2M hugepages=1024 intel_idle.max_cstate=0 processor.max_cstate=0"
+
+# Notes:
+#  - isolcpus/nohz_full/rcu_nocbs on a KVM GUEST only help if the HOST also
+#    pins this VM's vCPUs to real cores and doesn't oversubscribe them --
+#    otherwise the guest is isolating cores that the hypervisor is still
+#    timesharing underneath it. Confirm pinned vCPU allocation with the
+#    provider (docs/infrastructure/colo-deployment.md, section 10, Q1).
+#  - intel_idle.max_cstate / processor.max_cstate are frequently not
+#    honoured inside a VM at all (the hypervisor owns real C-states); keep
+#    them for bare metal or pass-through deployments, harmless elsewhere.

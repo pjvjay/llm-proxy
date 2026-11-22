@@ -1,10 +1,11 @@
 # Design: OpenJev evaluations as low-latency guardrails for agentic traffic
 
-Status: steps 1-3 of section 7 (hygiene, incremental scanning, tool-result /
-tool-call gating) are **implemented and benchmarked** -- see
-[perf-report.md](perf-report.md). Several assumptions below were corrected by
-measurement; those spots are marked **[measured]**. Steps 4+ (evaluator
-protocol, OpenJev adapter, tier-1 race, streaming) remain proposals.
+Status: steps 1–3 implemented; the System-1 / System-2 mapping (§8) and tier-1
+racing are implemented; OWASP LLM Top-10 (2025) mapping of every evaluation,
+audit log and metrics, and the compose deployment (model-init, OpenJev slot in
+`models/decision`) are implemented — see README. No OpenJev model exists yet to
+load (the PyPI package is a placeholder); the slot is verified with a synthetic
+multi-label model.
 
 ## 0. A note on OpenJev
 
@@ -154,20 +155,9 @@ deadline; cost becomes `max()`, not `sum()`. Presidio moves off the event loop
 pool and the keep-alive connection). Redaction reuses the analyzer results from
 detection rather than re-analysing.
 
-> **[measured]** `asyncio.to_thread` was the *worst* option: Presidio is
-> CPU-bound Python, so threads contend for the GIL (p50 158 ms vs 51 ms inline
-> at 16 concurrent flows). Implemented instead: a cheap inline prefilter plus a
-> small `spawn` process pool (p50 36 ms, loop stall 4 ms). Perf report, B2.
-
 ### 4.3 Transport
 One module-level `httpx.AsyncClient(http2=True)` with keep-alive to the
-guardrails service (or a Unix socket, since both are on the same host).
-
-> **[measured]** HTTP/2 is not applicable: httpx does not speak cleartext h2c
-> and uvicorn does not serve HTTP/2. A persistent HTTP/1.1 keep-alive client is
-> what matters (per-call client: ~50 ms of TLS-context setup per call). A Unix
-> socket was only modestly faster and inconsistent across runs; it is opt-in
-> (`GUARDRAILS_UDS`). Perf report, B1. For
+guardrails service (or a Unix socket, since both are on the same host). For
 ONNX-only evaluators, an in-process option (`EVAL_INPROC=1`) removes the HTTP hop
 entirely at the cost of coupling the addon to onnxruntime.
 
@@ -189,12 +179,6 @@ Replace `truncation=True, max_length=512` with sliding windows (e.g. 384 tokens,
 stride 256), batch all windows in one ONNX call, take the max score. Closes the
 "append the injection after 512 tokens" bypass; batching keeps the cost close
 to a single call for moderate lengths.
-
-> **[measured]** Wrong on CPU: cost is linear in the number of windows and
-> batching did not help (it made DeBERTa *slower*: 5 windows 5.5 s at batch 1
-> vs 6.3 s at batch 4). Implemented: per-check window caps (injection: head +
-> tail, 2 windows) plus the incremental cache, so each tool result is scored
-> once. Perf report, B3.
 
 ### 4.6 Streaming (`stream: true`)
 Set `flow.response.stream = inspector` in `responseheaders()`. The inspector:
@@ -392,16 +376,19 @@ file contents returned by tools, including ones past the 512-token mark) and
 
 ---
 
-## 7. Suggested order of work
+## 7. Order of work and status
 
-1. **Hygiene (no new deps):** persistent httpx client; Presidio off the event
-   loop and concurrent with classifiers; single analyse + reuse for redaction;
-   handle list-valued `content`; catch-all in hooks → fail-closed; windowed
-   scoring instead of truncation. Expect tier-0 p95 to drop substantially and
-   the fail-open bug to close.
-2. **Session + incremental scanning** (`session.py`): O(N) agent loops.
-3. **Tool-result scanning and tool-call gating** (`tool_policy.py`): the agentic
-   guardrail itself, deterministic first.
+1. **Hygiene — DONE.** Persistent httpx client (the per-call client cost ~53 ms of
+   SSL-context construction); Presidio once, in a process pool (thread pool
+   measured worse), concurrent with the classifiers; list-valued `content`;
+   catch-all → fail-closed; windowed scoring; guardrails threading fixed;
+   `stream: true` de-streamed and re-emitted as SSE so it is no longer
+   fail-open. Measurements and decisions: `bench/README.md`.
+2. **Session + incremental scanning — DONE** (`session.py`, `content.py`).
+3. **Tool-result scanning and tool-call gating — DONE** (`tool_policy.py`, addon
+   request/response paths; datasets `tool_injection.jsonl`, `tool_calls.jsonl`;
+   `evals/run_eval.py` stages). Verify the HF `return_overflowing_tokens` path
+   against the real DeBERTa / Granite tokenizers when models are available.
 4. **Evaluator protocol + policy.yaml + registry**: refactor existing checks
    onto it; `decide()` keeps its signature so `tests/test_policy.py` still passes.
 5. **OpenJev adapter in shadow mode** (tier 2) → collect disagreements.
@@ -409,4 +396,56 @@ file contents returned by tools, including ones past the 512-token mark) and
 7. **Streaming inspector.**
 8. **`/v1/responses` support** (same pipeline, different message shape).
 
-Steps 1–4 stand on their own; 5–6 are where OpenJev plugs in; 7–8 widen coverage.
+Steps 1–3 are in. Step 6 (tier-1 race) is in as part of §8. Step 5 is reframed by
+§8: Jev is a System-1 decision model, so it plugs in at tier 0 through
+`/v1/decide`, not as a shadow-mode judge. Remaining: 4 (policy.yaml), 7, 8.
+
+## 8. Jev as a System-1 decision model
+
+Jev is described as a *System One* decision model — in the dual-process sense:
+fast, automatic, single-pass, returning a decision with a confidence rather than
+deliberating. That changes where it sits relative to §2:
+
+| §2 tier | dual-process role | implementation |
+|---|---|---|
+| tier 0 gate | **System 1** — every new unit, one pass, all labels | `/v1/decide` (`guardrails/server.py`), `_MultiLabelOnnxBackend`; proxy applies per-role confidence bands (`policy.BANDS`) → allow / block / uncertain |
+| tier 1 race | **System 2** — uncertain units only | `mitmproxy/system2.py`: LLM judge (Granite Guardian / vLLM, P(Yes) from logprobs), `S2_MODE=inline\|race`, verdict cache, load shedding, deadline |
+| tier 2 shadow | System 2 → System 1 learning | `ESCALATION_LOG` + `evals/calibrate_bands.py` (System 2 as teacher narrows System 1's bands) |
+
+Properties exploited, and where each shows in the controlled benchmarks
+(`bench/controlled/REPORT.md`):
+
+1. **One pass, all labels** — forward passes −50% for user messages (two
+   labels), −35% on the W1 mix. Independent of model speed.
+2. **Calibrated confidence → escalate only the uncertain** — 30 of 200
+   prompts judged; errors 14 → 3 (judge modelled as wrong 1 in 10).
+3. **Context-conditioned** — role / tool passed with every item;
+   `context_template` in `labels.json`; per-role bands.
+4. **System 2 is scarce** — raced: no request pays for the judge while it is
+   faster than upstream (Sweep B); cached: each distinct content judged once;
+   shed: a burst degrades to System 1 instead of queueing past the deadline (W3).
+5. **Session risk** — after a block / withhold, the session's bands widen and
+   side-effecting tool calls get a System-2 intent check (catches the
+   goal-inconsistent `send_email` in W2 that no deterministic rule matches).
+   Read-only tools are exempt — the controlled run showed judging every call
+   added ~400 ms to every remaining turn.
+
+Where a System-1 model does *not* help: roles needing one label. With a model
+much slower per window than the dedicated 33 ms toxicity head, responses get
+slower (Sweep A); route them to the dedicated head
+(`DECISION_SINGLE_LABEL_ROLES=assistant`).
+
+Still unknown without the real model: Jev's per-window cost and its calibration
+on this traffic. Both plug straight into `bench/controlled/costs.py` and
+`calibrate_bands.py` once available.
+
+## 9. Deploying alongside latency-sensitive systems
+
+If this proxy sits in front of an agentic/decision-support system that itself
+runs in a colocated, low-latency environment (trading infrastructure being the
+sharpest version of this), the System-1/System-2 split above is not optional
+polish — it's the only way an LLM-based gate can avoid being the slowest thing
+in the path. See `docs/infrastructure/colo-deployment.md` for the
+hardware/network reference architecture this implies (per-venue pods, local
+model inference instead of a public SaaS API in the hot path, and a latency
+budget that separates what tuning can buy from what only model choice can).

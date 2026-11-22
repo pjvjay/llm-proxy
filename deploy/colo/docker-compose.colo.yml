@@ -1,0 +1,71 @@
+# Compose override for a colocated "node A" (hot path: agent, mitmproxy addon,
+# guardrails System-1 service). Apply on top of the base file:
+#
+#   docker compose -f docker-compose.yml -f deploy/colo/docker-compose.colo.yml up
+#
+# Every cpuset / taskset value below is an EXAMPLE for an 8-core pinned VM
+# (cores 0-1 reserved for the host/NIC IRQs, 2-7 for this application) --
+# replace with the real pinned-core range for your VM (deploy/colo/README.md).
+# `network_mode: host` removes the bridge/NAT hop between containers on the
+# same VM; it means container ports bind directly on the host, so only do this
+# on a VM dedicated to this stack. Host networking can't be combined with the
+# base file's `networks:` / `ports:`, hence the `!reset` tags (Compose >= 2.24),
+# and services reach each other on 127.0.0.1 instead of by service name.
+
+services:
+  model-init:
+    network_mode: host
+    networks: !reset []
+
+  guardrails:
+    network_mode: host
+    networks: !reset []
+    ports: !reset []                    # listens on the host's :8000 directly
+    cpuset: "4-5"                       # ADAPT: pinned cores for GUARDRAILS_WORKERS x ORT_INTRA_THREADS
+    environment:
+      GUARDRAILS_WORKERS: "2"           # keep workers x ORT_INTRA_THREADS <= cpuset core count
+      ORT_INTRA_THREADS: "1"
+      TORCH_THREADS: "1"
+    cap_add:
+      - SYS_NICE                        # allows the process to raise its own scheduling priority
+      - IPC_LOCK                        # required to mlock huge pages
+    ulimits:
+      memlock: -1                       # unlimited lockable memory (huge pages for ONNX Runtime / torch)
+      rtprio: 99
+    # GUARDRAILS_URL should now point at the host's loopback / UDS instead of
+    # the bridge network's service DNS name -- see the mitmproxy block below.
+
+  mitmproxy:
+    network_mode: host
+    networks: !reset []
+    cpuset: "2-3"                       # ADAPT: the addon's own pinned cores
+    environment:
+      GUARDRAILS_URL: http://127.0.0.1:8000    # was http://guardrails:8000 (bridge DNS); host networking needs loopback
+      # Prefer a Unix domain socket over loopback TCP if guardrails listens on one:
+      # GUARDRAILS_UDS: /run/firewall/guardrails.sock
+      PII_EXECUTOR: process
+      PII_WORKERS: "2"
+      S2_MODE: race                     # race, not inline, once a real GPU judge is reachable
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+      rtprio: 99
+
+  nginx:
+    # Keep nginx only if this node terminates TLS from OUTSIDE the cage. For the
+    # node-internal hops (agent <-> addon <-> guardrails <-> local LLM) use a
+    # Unix socket or direct mTLS instead; remove this service entirely on a pure
+    # internal node. With host networking nginx listens on the host's :443.
+    network_mode: host
+    networks: !reset []
+    ports: !reset []
+    environment:
+      FIREWALL_UPSTREAM: 127.0.0.1:8080
+
+  client:
+    # Placeholder for the real agent/trading app in this deployment; remove the
+    # demo client and run the actual agent pinned to its own cores, talking to
+    # mitmproxy over a Unix socket or loopback, not a public URL.
+    profiles: ["demo-only"]

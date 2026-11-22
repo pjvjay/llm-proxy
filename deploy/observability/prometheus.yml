@@ -1,0 +1,15 @@
+# Node C: scrapes the firewall and the decision service on the internal network.
+# The firewall's /firewall/* endpoints are refused by nginx from outside.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: firewall            # OWASP LLM Top-10 counters, actions, cache, System-2 stats
+    metrics_path: /firewall/metrics
+    static_configs:
+      - targets: ["mitmproxy:8080"]
+
+  - job_name: guardrails          # decision calls, window-passes, supply-chain status
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["guardrails:8000"]
