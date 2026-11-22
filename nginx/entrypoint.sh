@@ -14,4 +14,8 @@ if [ ! -f "$CERT_DIR/nginx.crt" ]; then
     echo "[nginx-entrypoint] Certificate written to $CERT_DIR/nginx.crt"
 fi
 
+export FIREWALL_UPSTREAM="${FIREWALL_UPSTREAM:-mitmproxy:8080}"
+# Only substitute our variable -- nginx's own $variables must survive.
+envsubst '${FIREWALL_UPSTREAM}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+nginx -t
 exec nginx -g "daemon off;"

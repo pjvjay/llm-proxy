@@ -2,6 +2,7 @@
 fastapi==0.115.*
 uvicorn[standard]==0.32.*
 onnxruntime==1.19.*
+onnx==1.16.*
 transformers==4.48.*
 sentencepiece==0.2.*
 torch==2.2.*
