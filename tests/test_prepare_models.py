@@ -48,7 +48,10 @@ def test_validate_keep_and_discard():
         model(fp32)
         ref = P.onnx_probs(fp32, tok, P.PROBES, 1)            # stands in for the PyTorch reference
         assert ref[2] > ref[0]                                 # toxic probe scores higher than benign
-        quantize_dynamic(fp32, int8, weight_type=QuantType.QInt8)
+        # reduce_range (7-bit weights): on x86 CPUs without VNNI, onnxruntime's
+        # 8-bit integer MatMul saturates and this model drifts by ~0.3 from fp32,
+        # so the "good export is kept" case would depend on the host CPU.
+        quantize_dynamic(fp32, int8, weight_type=QuantType.QInt8, reduce_range=True)
         rep = P.keep_validated(d, fp32, int8, ref, tok, 1)
         assert rep["model_quantized.onnx"]["kept"] and os.path.exists(int8)
         assert not os.path.exists(fp32)                        # superseded by the validated int8 model
