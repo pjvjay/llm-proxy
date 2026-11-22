@@ -14,7 +14,7 @@ so quality numbers are meaningless; every code path is real.
 Runs the README acceptance commands (curl, identical except for the port),
 the official OpenAI SDK against the stack (if `openai` is installed), the
 response-side OWASP checks, internal endpoints, run_eval.py, and then swaps a
-multi-label System-1 model into the OpenJev slot and repeats the key checks.
+multi-label System-1 model into the decision slot and repeats the key checks.
 
     python tests/test_native_stack.py        (needs mitmproxy, uvicorn, curl)
 """
@@ -206,7 +206,7 @@ def main():
     finally:
         stack.down()
 
-    # OpenJev slot: drop a multi-label System-1 model in, restart, repeat
+    # Decision slot: drop a multi-label System-1 model in, restart, repeat
     synthetic_models.build_decision(models)
     stack = Stack(models, {"LABELS_USER": "injection,toxicity,system_prompt_extraction"}).up()
     try:
@@ -216,7 +216,7 @@ def main():
         assert spe["owasp"] == ["LLM01:2025", "LLM07:2025"], spe          # the model's declared mapping
         rep = run_eval(stack, os.path.join(tmp, "eval_decision.md"))
         assert "System-1 decision model `openjev-slot-conformance`" in rep
-        print("  OpenJev slot (multi-label System-1 model): acceptance, extra head, declared OWASP map, eval OK")
+        print("  Decision slot (multi-label System-1 model): acceptance, extra head, declared OWASP map, eval OK")
     finally:
         stack.down()
     shutil.rmtree(tmp, ignore_errors=True)

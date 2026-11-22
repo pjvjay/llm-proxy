@@ -2,24 +2,43 @@
 
 Status: steps 1–3 implemented; the System-1 / System-2 mapping (§8) and tier-1
 racing are implemented; OWASP LLM Top-10 (2025) mapping of every evaluation,
-audit log and metrics, and the compose deployment (model-init, OpenJev slot in
-`models/decision`) are implemented — see README. No OpenJev model exists yet to
-load (the PyPI package is a placeholder); the slot is verified with a synthetic
-multi-label model.
+audit log and metrics, and the compose deployment (model-init, a generic ONNX
+classifier slot in `models/decision`) are implemented — see README. The slot is
+verified with a synthetic multi-label model. OpenJev itself is **not**
+integrated: it cannot be loaded into that slot (§0), and the HTTP adapter it
+needs has not been written.
 
 ## 0. A note on OpenJev
 
-At the time of writing, the `openjev` package on PyPI (0.0.1) is a placeholder
-(`__version__` only, classifier "Development Status :: 1 - Planning") and the
-GitHub repo was not reachable from the environment this was written in. The design
-below therefore treats OpenJev as *"a library of evaluators that take
-(input, output, context) and return a score / verdict / rationale"* and isolates
-it behind one adapter (`evaluators/openjev_adapter.py`). Everything else — tiers,
-session cache, streaming, tool-call gating, policy — is independent of OpenJev's
-concrete API and is where the latency wins actually come from.
+OpenJev is a published model. As read from the public HuggingFace API and model
+card on 2026-11-21:
 
-If OpenJev evaluators turn out to be LLM-as-judge style, they belong in tiers 1–2
-below. If some are deterministic / small-model, they can also run in tier 0.
+- `openjev/openjev` is a public decision model with 27.4 billion parameters.
+  Its files are safetensors weights; there is no ONNX build.
+- It is served by vLLM, with a helper (`helper/shim.py`) in front that exposes
+  `POST /v1/systemone`. The request carries a `state` and a list of `questions`.
+- The card quotes about 80 ms for a short text decision on one H100.
+- The weights are licensed CC BY-NC 4.0, which excludes commercial use.
+- The `openjev` package on PyPI (0.0.1) is only a placeholder (classifier
+  "Development Status :: 1 - Planning"). The model does not come from it.
+
+This design was written from the PyPI placeholder alone, before those facts
+were checked. It therefore treats OpenJev as *"a library of evaluators that
+take (input, output, context) and return a score / verdict / rationale"* and
+isolates it behind one adapter (`evaluators/openjev_adapter.py`). Everything
+else — tiers, session cache, streaming, tool-call gating, policy — is
+independent of OpenJev's concrete API and is where the latency wins actually
+come from.
+
+What the facts above change:
+
+- The adapter is an HTTP client for `/v1/systemone`, not a wrapper around an
+  in-process Python evaluator (§5.2).
+- The model needs a GPU node. The `models/decision` slot runs an ONNX
+  classifier on CPU inside the guardrails service and cannot hold it (§8).
+- Its cost and calibration on this traffic have not been measured here. The
+  80 ms figure is the model card's, for a short decision on an H100; compare it
+  with the tier budgets in §2 before choosing a tier.
 
 ---
 
@@ -264,14 +283,19 @@ class Evaluator(Protocol):
     async def evaluate(self, inp: EvalInput) -> EvalResult: ...
 ```
 
-### 5.2 OpenJev adapter (shape only — to be filled in against the real API)
+### 5.2 OpenJev adapter (shape only — not implemented)
+
+This sketch predates §0 and assumes an in-process Python evaluator. The real
+interface is HTTP (`POST /v1/systemone` with a `state` and `questions`), so
+`_jev.evaluate(...)` below stands for that request. The `Evaluator` protocol
+around it is unchanged.
 
 ```python
 # evaluators/openjev_adapter.py
 class OpenJevEvaluator:
     """Adapts one OpenJev evaluator to the proxy's Evaluator protocol.
 
-    Assumptions to confirm against OpenJev's real API:
+    Assumptions made before the real API was checked (see the note above):
       - an evaluator object can be constructed once (rubric / model loaded at startup)
       - it exposes a call like  evaluate(input=..., output=..., context=...) -> result
       - result carries a numeric score and/or a pass/fail plus an optional rationale
@@ -397,10 +421,19 @@ file contents returned by tools, including ones past the 512-token mark) and
 8. **`/v1/responses` support** (same pipeline, different message shape).
 
 Steps 1–3 are in. Step 6 (tier-1 race) is in as part of §8. Step 5 is reframed by
-§8: Jev is a System-1 decision model, so it plugs in at tier 0 through
-`/v1/decide`, not as a shadow-mode judge. Remaining: 4 (policy.yaml), 7, 8.
+§8: Jev is a System-1 decision model, so the plan was to plug it in at tier 0
+through `/v1/decide`, not as a shadow-mode judge. What is built for that is the
+generic ONNX slot; the OpenJev adapter itself is still open (§0). Remaining: 4
+(policy.yaml), 5 (the adapter), 7, 8.
 
 ## 8. Jev as a System-1 decision model
+
+Scope of this section: the System-1 / System-2 mechanism below is implemented
+and tested with stock and synthetic ONNX classifiers. It has not been run with
+OpenJev. `_MultiLabelOnnxBackend` loads an ONNX sequence classifier on CPU; the
+OpenJev model is served by vLLM on a GPU and answers over HTTP (§0), so it
+needs an HTTP adapter and a GPU node, not the ONNX slot (README, "Using
+OpenJev").
 
 Jev is described as a *System One* decision model — in the dual-process sense:
 fast, automatic, single-pass, returning a decision with a confidence rather than
@@ -435,9 +468,10 @@ much slower per window than the dedicated 33 ms toxicity head, responses get
 slower (Sweep A); route them to the dedicated head
 (`DECISION_SINGLE_LABEL_ROLES=assistant`).
 
-Still unknown without the real model: Jev's per-window cost and its calibration
-on this traffic. Both plug straight into `bench/controlled/costs.py` and
-`calibrate_bands.py` once available.
+Not measured here: Jev's cost per decision and its calibration on this traffic.
+The model card quotes about 80 ms for a short text decision on one H100 (§0);
+the controlled benchmarks assume 33 ms per window instead. Measured values plug
+straight into `bench/controlled/costs.py` and `calibrate_bands.py`.
 
 ## 9. Deploying alongside latency-sensitive systems
 

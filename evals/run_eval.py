@@ -7,7 +7,7 @@ the OWASP Top 10 for LLM Applications (2025), plus a Top-10 coverage table.
 
 Model-backed stages go through the guardrails service's System-1 endpoint
 (/v1/decide) -- the same call the proxy makes -- so whatever decision backend is
-loaded (the stock classifiers, or a System-1 model such as an OpenJev export in
+loaded (the stock classifiers, or your own ONNX System-1 model in
 models/decision) is what gets evaluated; the report records which one.
 Deterministic stages (tool calls, system-prompt leak, output handling,
 consumption limits, and PII when Presidio is installed) run locally and need no

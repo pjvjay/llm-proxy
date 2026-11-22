@@ -6,7 +6,7 @@ deterministic rule) is tagged with the OWASP categories it provides evidence
 for. Tags travel with the decision: response headers, the `firewall` object in
 blocked responses, the audit log, /firewall/metrics, and the eval report.
 
-A System-1 decision model (e.g. an OpenJev export in models/decision) can
+A System-1 decision model (your own ONNX classifier in models/decision) can
 declare its own label -> OWASP mapping in labels.json ("owasp" key); the
 guardrails service returns it with every /v1/decide call and it takes
 precedence over DEFAULT_MAP for the labels it names.

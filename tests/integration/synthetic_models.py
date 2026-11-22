@@ -5,7 +5,7 @@ They are keyword-triggered (embedding lookup + max over tokens): their scores
 are meaningless as a measure of model quality. They exist to exercise every
 code path between a request and a decision -- tokenizer, windowing, ONNX
 Runtime, backend auto-detection, manifest verification, /v1/decide, the
-multi-label (OpenJev slot) backend and its OWASP mapping."""
+multi-label (decision slot) backend and its OWASP mapping."""
 import json
 import os
 import re
@@ -91,7 +91,7 @@ def build_stock(root):
 
 
 def build_decision(root, name="openjev-slot-conformance"):
-    """./models/decision: a multi-label System-1 model in the OpenJev slot
+    """./models/decision: a multi-label System-1 model in the decision slot
     format, declaring its own OWASP mapping, with its own manifest."""
     vocab = _vocab()
     d = os.path.join(root, "decision")

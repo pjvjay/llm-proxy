@@ -35,7 +35,7 @@ THRESHOLDS = {
 }
 
 # Labels beyond the built-in ones (e.g. extra heads of a System-1 decision
-# model such as an OpenJev export: "jailbreak", "system_prompt_extraction", ...)
+# model in models/decision: "jailbreak", "system_prompt_extraction", ...)
 # get a generic policy, overridable per label:
 #   <LABEL>_ACTION (default block), <LABEL>_FAIL (default open -- extra labels
 #   are additive; the core injection label stays fail-closed), <LABEL>_THRESHOLD.

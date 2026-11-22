@@ -90,7 +90,7 @@ WORKERS = int(os.getenv("GUARDRAILS_WORKERS", "2"))
 INTRA = int(os.getenv("ORT_INTRA_THREADS", str(max(1, _CORES // WORKERS))))
 TORCH_THREADS = int(os.getenv("TORCH_THREADS", str(max(1, _CORES // WORKERS))))
 
-# auto: a System-1 decision model (e.g. an OpenJev export) is used when its
+# auto: a System-1 decision model (your own ONNX classifier) is used when its
 # slot contains labels.json; otherwise the composite of the stock classifiers.
 DECISION_BACKEND = os.getenv("DECISION_BACKEND", "auto")
 DECISION_MODEL_DIR = os.getenv("DECISION_MODEL_DIR", f"{MODELS_ROOT}/decision")

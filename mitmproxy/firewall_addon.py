@@ -5,7 +5,7 @@ System 1 -- every *new* text unit (user message / tool result), inline:
     limits (LLM10) -> canonicalize -> regex (user only)
       -> [ decision model || PII ] -> confidence band per (role, label)
     The decision model (guardrails /v1/decide: the stock classifiers, or a
-    System-1 model such as an OpenJev export in models/decision) returns a
+    System-1 ONNX model of your own in models/decision) returns a
     probability for every label relevant to the unit's role in ONE round-trip.
 System 2 -- only the uncertain (unit, label) pairs:
     LLM judge (system2.py), inline or raced against the upstream call

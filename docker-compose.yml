@@ -24,7 +24,7 @@ services:
     restart: "no"
     networks: [proxy-net]
 
-  # ── node A: System-1 decision service (stock classifiers or an OpenJev model) ─
+  # ── node A: System-1 decision service (stock classifiers or your ONNX model) ─
   guardrails:
     env_file: [{path: .env, required: false}]
     build: ./guardrails

@@ -239,7 +239,7 @@ Includes `test_native_stack.py` — the real `guardrails` (uvicorn) and `mitmdum
 processes wired as compose wires them, synthetic models in the `./models` layout,
 a mock upstream, the acceptance commands above (curl), the official OpenAI SDK in
 streaming and non-streaming mode, the OWASP response-side checks, `run_eval.py`,
-and the OpenJev slot — plus an end-to-end addon test, model-init / manifest tests,
+and the decision-model slot — plus an end-to-end addon test, model-init / manifest tests,
 a real multi-label ONNX decision-model test, the System-2 client on a virtual
 clock, and `test_controlled.py` (benchmark assertions + determinism).
 `scripts/validate_compose.py` checks the compose files against the Compose
@@ -254,14 +254,15 @@ python bench/controlled/run.py --sweep     # controlled, deterministic -> bench/
 The `bench/bench_*.py` wall-clock scripts are for dedicated hardware; see
 `bench/README.md` for why their sandbox results are indicative only.
 
-## Deploying a System-1 decision model (the OpenJev slot)
+## Deploying a System-1 decision model (the ONNX classifier slot)
 
 The guardrails service answers every evaluation through one System-1 endpoint,
-`/v1/decide`. By default it is backed by the two stock classifiers. Drop a
-multi-label System-1 decision model into `./models/decision/` and restart the
-`guardrails` service — it is picked up automatically (`DECISION_BACKEND=auto`)
-and from then on **every** evaluation call (proxy and `run_eval.py`) goes
-through it, one forward pass per window for all labels:
+`/v1/decide`. By default it is backed by the two stock classifiers.
+`./models/decision/` is a generic slot for one multi-label **ONNX sequence
+classifier** of your own, run on CPU by onnxruntime. Drop such a model in and
+restart the `guardrails` service — it is picked up automatically
+(`DECISION_BACKEND=auto`) and from then on **every** evaluation call (proxy and
+`run_eval.py`) goes through it, one forward pass per window for all labels:
 
 ```
 models/decision/
@@ -272,7 +273,7 @@ models/decision/
 ```
 
 ```json
-{"name": "openjev-...", "version": "...",
+{"name": "my-decision-model", "version": "...",
  "labels": ["injection", "toxicity", "system_prompt_extraction"],
  "activation": "sigmoid",
  "temperature": {"injection": 1.0},
@@ -291,12 +292,40 @@ models/decision/
 * If the model's per-window cost is not well below the dedicated heads', route
   single-label roles to them: `DECISION_SINGLE_LABEL_ROLES=assistant`.
 
-**Status of OpenJev itself:** the `openjev` package on PyPI is a 0.0.1 placeholder
-with no model or API, so no OpenJev model ships with this repo. The slot is
-verified end to end with a synthetic multi-label model in exactly this format
-(`tests/test_native_stack.py`, `tests/test_decision_backend.py`). If a real
-OpenJev release ships in another form, only `_MultiLabelOnnxBackend` in
-`guardrails/server.py` changes.
+No model ships in the slot. It is verified end to end with a synthetic
+multi-label model in exactly this format (`tests/test_native_stack.py`,
+`tests/test_decision_backend.py`). The slot is not an OpenJev integration: see
+the next section.
+
+## Using OpenJev
+
+Not implemented in this repo. OpenJev is a published model, but it cannot go in
+the ONNX slot above. As read from the public HuggingFace API and model card on
+2026-11-21:
+
+* [`openjev/openjev`](https://huggingface.co/openjev/openjev) is a public
+  decision model with 27.4 billion parameters. Its files are safetensors
+  weights; there is no ONNX build.
+* It is served by vLLM, with a helper (`helper/shim.py`) in front that exposes
+  `POST /v1/systemone`. The request carries a `state` and a list of `questions`.
+* The card quotes about 80 ms for a short text decision on one H100.
+* The weights are licensed CC BY-NC 4.0, which excludes commercial use.
+* The `openjev` package on PyPI (0.0.1) is only a placeholder. The model does
+  not come from it.
+
+So using OpenJev here would need two things this repo does not have:
+
+1. **A GPU node** that runs vLLM and the helper. The `guardrails` container is
+   CPU-only and loads the slot with onnxruntime's CPU provider.
+2. **An HTTP judge adapter** that turns a unit to screen into a
+   `/v1/systemone` request and maps the answer back to a per-label decision.
+   Neither existing client can do this as it is: the System-2 client
+   (`mitmproxy/system2.py`) calls an OpenAI-compatible `/v1/chat/completions`
+   endpoint and reads Yes/No logprobs, and the decision slot only loads ONNX
+   files.
+
+None of the latency, quality or benchmark figures in this README were measured
+with OpenJev.
 
 ## OWASP Top 10 for LLM Applications (2025)
 
@@ -394,8 +423,8 @@ compose override and host-tuning scripts.
 ## Roadmap
 
 See `docs/openjev-evaluations-design.md` for the tiered evaluation design and its
-status. Next: a real OpenJev model in the decision slot once one is published
-(calibrate its bands with `evals/calibrate_bands.py`), the evaluator protocol +
+status. Next: an HTTP judge adapter for OpenJev on a GPU node (see "Using
+OpenJev"; calibrate its bands with `evals/calibrate_bands.py`), the evaluator protocol +
 `policy.yaml`, a token-by-token SSE inspector for deterministic checks,
 `/v1/responses` support, grounding checks (OWASP LLM09), token-cost budgets, and a
 faster injection path (clean DeBERTa export or a BERT-based model).

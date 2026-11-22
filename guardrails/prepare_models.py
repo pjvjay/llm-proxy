@@ -14,8 +14,8 @@ access to the Hugging Face Hub (and HF_TOKEN for gated models).
                        match the PyTorch model on a probe set (else the
                        guardrails service falls back to PyTorch for it)
   /models/MANIFEST.sha256   sha256 of every file above (OWASP LLM03)
-  /models/decision/    the System-1 decision-model slot (e.g. an OpenJev
-                       export). Left alone -- only a README is created.
+  /models/decision/    the System-1 decision-model slot (your own ONNX
+                       classifier). Left alone -- only a README is created.
 
 Env: INJECTION_HF_ID / INJECTION_HF_REVISION, TOXICITY_HF_ID /
 TOXICITY_HF_REVISION (pin a commit hash for reproducible, supply-chain-safe
@@ -177,7 +177,7 @@ def ensure_decision_slot():
     readme = os.path.join(d, "README.txt")
     if not os.path.exists(readme):
         with open(readme, "w") as f:
-            f.write("System-1 decision-model slot (e.g. an OpenJev export).\n"
+            f.write("System-1 decision-model slot (your own ONNX classifier).\n"
                     "Put labels.json + an ONNX sequence classifier + its tokenizer here\n"
                     "(optionally MANIFEST.sha256) and restart the guardrails service; it is\n"
                     "picked up automatically (DECISION_BACKEND=auto). See README.md.\n")

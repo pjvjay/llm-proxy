@@ -6,7 +6,7 @@ works for operators too:
     <64 hex>  injection/model.safetensors
 
 prepare_models.py writes /models/MANIFEST.sha256 for what it downloads. A
-System-1 decision model (e.g. an OpenJev export) should ship its own
+System-1 decision model (your own ONNX classifier) should ship its own
 models/decision/MANIFEST.sha256 from wherever it was built and signed -- the
 guardrails service verifies every manifest it finds before loading anything,
 and refuses to start on a mismatch. Pure stdlib."""
