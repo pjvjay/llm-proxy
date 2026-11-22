@@ -26,12 +26,35 @@ flowchart LR
     Addon -.->|redact both ways| PII["PII / secrets<br/>Presidio"]
 ```
 
-Request path: `canonicalize → regex → parallel(injection, toxicity) → PII redact → forward`
-Response path: `toxicity + PII redact on model output`
+Request path (per message, **incremental**): `cache lookup → canonicalize → regex →
+parallel(injection, toxicity) ‖ PII → decide → forward`
+Response path: `tool-call policy → toxicity ‖ PII on model output` (JSON **and** SSE)
 
-Blocked or withheld calls still return a valid OpenAI `chat.completion` (HTTP 200)
-so client SDKs don't raise. Injection and PII **fail closed** if the classifier
-service is unreachable; toxicity fail mode is configurable.
+Blocked or withheld calls still return a valid OpenAI `chat.completion` (HTTP 200,
+SSE when the client streams) so client SDKs don't raise. Injection, PII and
+tool-call checks **fail closed** if their dependency is down, and any unexpected
+error inside the addon blocks rather than forwarding unscreened; toxicity fail
+mode is configurable.
+
+### Agentic traffic
+
+Agents re-send the whole conversation every turn and feed tool output back to
+the model. The proxy therefore:
+
+* **scans each message once** — results are cached by a SHA-256 digest of the
+  message (plus, for prompts, the tail of the previous one, to catch payloads
+  split across turns), so a turn only pays for what is new;
+* **screens `role: tool` messages** for injection + PII. An injection found in a
+  tool result is **quarantined** (that output is replaced, the call proceeds)
+  rather than failing the agent's whole call (`TOOL_RESULT_INJECTION_ACTION`);
+* **gates tool calls** the model returns (`tool_policy.py`): tool must be
+  declared in the request, optional allow/deny lists and URL egress allowlist,
+  and deny patterns for destructive shell, remote exec, destructive SQL,
+  credential access, path traversal and secrets in arguments (NFKC /
+  zero-width / base64 de-obfuscated; RE2, linear time).
+
+See [docs/perf-report.md](docs/perf-report.md) for the measured trade-offs
+behind every one of these choices.
 
 ## What it screens
 
@@ -48,6 +71,13 @@ through `torch.onnx.export` — the exported graph runs but scores wrong (a blat
 injection scored 0.06 instead of 0.99). So injection runs in PyTorch; Granite HAP
 exports fine and stays on int8 ONNX. Backend is per-model via env
 (`BACKEND_INJECTION`, `BACKEND_TOXICITY`).
+
+> **Worth re-testing.** With torch 2.x / transformers 4.48, exporting a
+> `deberta-v3-base`-architecture model via `torch.onnx.export` (opset 17)
+> matched PyTorch to max |Δlogit| 4e-7 on identical weights (perf report, B3b),
+> and int8 ONNX ran 1.5–3.3× faster. Validate on the real weights with
+> `evals/run_eval.py` before switching. The injection model is the dominant
+> cost once tool results are screened (~1 s per 2 KB tool result on 4 vCPUs).
 
 ## Measured performance
 
@@ -100,10 +130,20 @@ cat evals/reports/firewall_eval.md
 ## Tests (no models needed)
 
 ```bash
+python -m pytest tests/          # needs mitmproxy + presidio (+ transformers for guardrails tests)
 python tests/test_canonicalize.py
 python tests/test_policy.py
 python tests/test_metrics.py
 ```
+
+## Benchmarks
+
+`bench/` holds the suite behind [docs/perf-report.md](docs/perf-report.md):
+transport (B1), PII (B2), windowing / batching / threads (B3, B3b, B3c), cache
+machinery (B4), tool policy + JSON (B5) and end-to-end through `mitmdump` against
+the original code (B6). Latency stand-ins for the models (same architecture,
+random weights) are built offline by `bench/standins/`. Results land in
+`bench/results/*.json`; `bench/report_tables.py` renders them.
 
 ## Configuration (.env)
 
@@ -115,10 +155,25 @@ python tests/test_metrics.py
 | `INJECTION_THRESHOLD` / `TOXICITY_THRESHOLD` | `0.5` | block above this score |
 | `PII_ACTION` | `redact` | `redact` \| `block` |
 | `TOXICITY_ACTION` / `TOXICITY_FAIL` | `block` / `open` | action + fail mode |
+| `TOOL_RESULT_CHECKS` | `injection,pii` | checks on `role: tool` messages |
+| `TOOL_RESULT_INJECTION_ACTION` | `redact` | `redact` = quarantine that output \| `block` the call |
+| `TOOL_CALL_ACTION` | `block` | action on a tool call that violates `tool_policy.py` |
+| `TOOL_REQUIRE_DECLARED` | `1` | tool calls must name a tool declared in the request |
+| `TOOL_ALLOWLIST` / `TOOL_DENYLIST` / `TOOL_URL_ALLOWLIST` | — | optional lists |
+| `TOOL_DISABLE_CATEGORIES` | — | e.g. `path_traversal` |
+| `SCAN_CACHE` / `SCAN_CACHE_MAX_BYTES` | `1` / 64 MiB | incremental scanning cache |
+| `SCAN_CONTEXT_CHARS` / `SCAN_CONTEXT_CHARS_TOOL` | `256` / `0` | previous-message tail scanned with each prompt / tool result |
+| `PII_NLP_MODEL` | `blank` | spaCy pipeline for Presidio (`blank` = tokenizer only) |
+| `PII_WORKERS` | `2` | PII process pool size (`0` = inline) |
+| `PII_PHONE_REGIONS` | Presidio's 8 | e.g. `US`: ~2.3× faster on number-dense text, misses other national formats |
+| `GUARDRAILS_UDS` | — | Unix socket to the guardrails service |
+| `MAX_WINDOWS_INJECTION` / `MAX_WINDOWS_TOXICITY` | `2` / `8` | 512-token windows scored per text (head + tail beyond that) |
+| `MODEL_CONCURRENCY` / `INTRA_OP_THREADS` | `2` / auto | concurrent forward passes per model / threads each (auto = CPUs ÷ concurrency) |
+| `INFER_BATCH_INJECTION` / `INFER_BATCH_TOXICITY` | `1` / `4` | windows per forward pass |
 
 ## Roadmap
 
-YAML policy engine + hot-reload · SSE streaming · Prometheus metrics + audit log ·
+YAML policy engine + hot-reload · true incremental SSE streaming · Prometheus metrics + audit log ·
 token rate/cost limits (OWASP LLM10) · OWASP LLM Top-10 mapping · faster injection
 path (clean DeBERTa export or a BERT-based model).
 
